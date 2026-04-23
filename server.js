@@ -147,14 +147,12 @@ io.on('connection', async (socket) => {
 // ─── Connect to MongoDB + Start Server ───────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
+// 🚀 Start server FIRST
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
+
+// 🔌 Connect DB separately
 mongoose.connect(process.env.MONGODB_URI)
-  .then(() => {
-    console.log('✅ MongoDB connected');
-    server.listen(PORT, () => {
-      console.log(`🚀 SocialSync server running on http://localhost:${PORT}`);
-    });
-  })
-  .catch(err => {
-    console.error('❌ MongoDB connection error:', err);
-    process.exit(1);
-  });
+  .then(() => console.log('✅ MongoDB connected'))
+  .catch(err => console.error('❌ MongoDB error:', err));
