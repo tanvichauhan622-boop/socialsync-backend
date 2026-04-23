@@ -5,7 +5,6 @@ const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
-const path = require('path');
 
 const User = require('./models/User');
 const Message = require('./models/Message');
@@ -13,6 +12,7 @@ const { getRoomId } = require('./routes/messages');
 
 const app = express();
 const server = http.createServer(app);
+
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',')
   : ['*'];
@@ -24,7 +24,6 @@ const io = new Server(server, {
 // Middleware
 app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 app.use(express.json());
-// API only — frontend served from Netlify
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
@@ -32,10 +31,12 @@ app.use('/api/users', require('./routes/users'));
 app.use('/api/plans', require('./routes/plans'));
 app.use('/api/messages', require('./routes/messages'));
 
-// Health check
-app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date() }));
+// Health check — always responds (Railway uses this)
+let dbConnected = false;
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', db: dbConnected ? 'connected' : 'connecting', time: new Date() });
+});
 
-// Health check only — no HTML serving
 app.get('/', (req, res) => res.json({ status: 'SocialSync API running' }));
 
 // ─── Socket.io ───────────────────────────────────────────────────────────────
@@ -57,30 +58,20 @@ io.on('connection', async (socket) => {
   const user = socket.user;
   console.log(`✅ ${user.name} connected (${socket.id})`);
 
-  // Mark online
   await User.findByIdAndUpdate(user._id, { online: true, socketId: socket.id });
-
-  // Broadcast to all that this user is online
   socket.broadcast.emit('user:online', { userId: user._id, name: user.name });
 
-  // ── Location update ──────────────────────────────────────────────────────
   socket.on('location:update', async ({ lat, lng }) => {
     try {
       await User.findByIdAndUpdate(user._id, {
         location: { type: 'Point', coordinates: [lng, lat] }
       });
-      // Broadcast updated position to nearby users (simple: broadcast to all)
-      socket.broadcast.emit('location:updated', {
-        userId: user._id,
-        name: user.name,
-        lat, lng
-      });
+      socket.broadcast.emit('location:updated', { userId: user._id, name: user.name, lat, lng });
     } catch (err) {
       console.error('Location update error:', err);
     }
   });
 
-  // ── Chat ─────────────────────────────────────────────────────────────────
   socket.on('chat:send', async ({ toUserId, text }) => {
     if (!text || !text.trim()) return;
     try {
@@ -101,10 +92,8 @@ io.on('connection', async (socket) => {
         roomId
       };
 
-      // Send to sender (confirmation)
       socket.emit('chat:message', payload);
 
-      // Send to receiver if online
       const receiver = await User.findById(toUserId);
       if (receiver?.socketId) {
         io.to(receiver.socketId).emit('chat:message', payload);
@@ -119,20 +108,14 @@ io.on('connection', async (socket) => {
     }
   });
 
-  // ── Join plan room ────────────────────────────────────────────────────────
-  socket.on('plan:join_room', (planId) => {
-    socket.join(`plan_${planId}`);
-  });
+  socket.on('plan:join_room', (planId) => socket.join(`plan_${planId}`));
 
-  socket.on('plan:created', (plan) => {
-    socket.broadcast.emit('plan:new', plan);
-  });
+  socket.on('plan:created', (plan) => socket.broadcast.emit('plan:new', plan));
 
   socket.on('plan:joined', ({ planId, userName }) => {
     io.emit('plan:attendee_joined', { planId, userName });
   });
 
-  // ── Disconnect ────────────────────────────────────────────────────────────
   socket.on('disconnect', async () => {
     console.log(`❌ ${user.name} disconnected`);
     await User.findByIdAndUpdate(user._id, {
@@ -144,15 +127,36 @@ io.on('connection', async (socket) => {
   });
 });
 
-// ─── Connect to MongoDB + Start Server ───────────────────────────────────────
+// ─── START SERVER FIRST, then connect MongoDB ────────────────────────────────
+// Server starts immediately so Railway healthcheck passes.
+// MongoDB connects in the background with auto-retry.
 const PORT = process.env.PORT || 3000;
 
-// 🚀 Start server FIRST
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 SocialSync running on port ${PORT}`);
 });
 
-// 🔌 Connect DB separately
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('✅ MongoDB connected'))
-  .catch(err => console.error('❌ MongoDB error:', err));
+const connectMongo = async () => {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    console.error('❌ MONGODB_URI is not set! Add it in Railway → Variables tab.');
+    return;
+  }
+  try {
+    await mongoose.connect(uri, { serverSelectionTimeoutMS: 10000 });
+    dbConnected = true;
+    console.log('✅ MongoDB connected');
+  } catch (err) {
+    console.error('❌ MongoDB failed:', err.message);
+    console.log('⏳ Retrying in 5s...');
+    setTimeout(connectMongo, 5000);
+  }
+};
+
+mongoose.connection.on('disconnected', () => {
+  dbConnected = false;
+  console.warn('⚠️ MongoDB disconnected, retrying...');
+  setTimeout(connectMongo, 5000);
+});
+
+connectMongo();
