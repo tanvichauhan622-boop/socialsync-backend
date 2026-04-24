@@ -25,8 +25,7 @@ const io = new Server(server, {
 app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 app.use(express.json());
 
-// Routes
-app.use('/api/auth', require('./routes/auth'));
+// Routes — auth handled by Supabase
 app.use('/api/users', require('./routes/users'));
 app.use('/api/plans', require('./routes/plans'));
 app.use('/api/messages', require('./routes/messages'));
@@ -44,12 +43,29 @@ io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth.token;
     if (!token) return next(new Error('No token'));
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId).select('-password');
-    if (!user) return next(new Error('User not found'));
+
+    const decoded = jwt.decode(token);
+    if (!decoded || !decoded.sub) return next(new Error('Invalid token'));
+
+    // Upsert user in MongoDB using Supabase identity
+    const User = require('./models/User');
+    let user = await User.findOneAndUpdate(
+      { _id: decoded.sub },
+      {
+        $setOnInsert: { _id: decoded.sub },
+        $set: {
+          name: decoded.user_metadata?.name || 'Anonymous',
+          age: decoded.user_metadata?.age || null,
+          interests: decoded.user_metadata?.interests || []
+        }
+      },
+      { upsert: true, new: true }
+    );
+
     socket.user = user;
     next();
   } catch (err) {
+    console.error('Socket auth error:', err.message);
     next(new Error('Auth failed'));
   }
 });
